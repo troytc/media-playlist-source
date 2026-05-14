@@ -32,6 +32,16 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define S_IS_URL "is_url"
 #define S_SPEED "speed_percent"
 #define S_REFRESH_FILENAME "refresh_filename"
+#define S_CURRENT_FILE_NAME_NO_EXT "current_track_name"
+#define S_TEXT_FILE_PATH "track_text_file"
+#define S_PLACEHOLDER_IMAGE "placeholder_image"
+
+/* Dimensions used for the placeholder when no album art is available and no
+ * placeholder image has been configured. Picked to be a common 16:9 size so
+ * the source has reasonable defaults in a scene.
+ */
+#define PLACEHOLDER_WIDTH 1280
+#define PLACEHOLDER_HEIGHT 720
 
 /* Media Source Settings */
 #define S_FFMPEG_LOCAL_FILE "local_file"
@@ -54,6 +64,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_RESTART_BEHAVIOR_CURRENT_FILE T_("RestartBehavior.CurrentFile")
 #define T_RESTART_BEHAVIOR_FIRST_FILE T_("RestartBehavior.FirstFile")
 #define T_CURRENT_FILE_NAME T_("CurrentFileName")
+#define T_CURRENT_FILE_NAME_NO_EXT T_("CurrentFileNameNoExt")
 #define T_SELECT_FILE T_("SelectFile")
 #define T_NO_FILE_SELECTED T_("NoFileSelected")
 #define T_USE_HARDWARE_DECODING T_("UseHardwareDecoding")
@@ -62,6 +73,10 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #define T_SPEED T_("Speed")
 #define T_SPEED_WARNING T_("SpeedWarning")
 #define T_REFRESH_FILENAME T_("RefreshFilename")
+#define T_TEXT_FILE_PATH T_("TextFilePath")
+#define T_TEXT_FILE_PATH_DESC T_("TextFilePath.Description")
+#define T_PLACEHOLDER_IMAGE T_("PlaceholderImage")
+#define T_PLACEHOLDER_IMAGE_DESC T_("PlaceholderImage.Description")
 
 #define T_PLAY_PAUSE T_("PlayPause")
 #define T_RESTART T_("Restart")
@@ -160,13 +175,58 @@ static bool valid_extension(const char *ext)
 	return valid;
 }
 
+/* Fills `out` with the basename of `path` with its extension stripped. URLs and
+ * paths without a trailing filename component fall back to the original string.
+ */
+static void get_filename_no_ext(const char *path, struct dstr *out)
+{
+	dstr_init(out);
+	if (!path || !*path)
+		return;
+
+	const char *base = path;
+	for (const char *p = path; *p; p++) {
+		if (*p == '/' || *p == '\\')
+			base = p + 1;
+	}
+
+	const char *ext = strrchr(base, '.');
+	if (ext && ext != base) {
+		dstr_ncopy(out, base, ext - base);
+	} else {
+		dstr_copy(out, base);
+	}
+}
+
+/* Writes the given text to the user-configured track-name text file if the
+ * path is set and the content has changed since the last write. The change
+ * check avoids touching disk every frame.
+ */
+static void write_track_text_file(struct media_playlist_source *mps, const char *text)
+{
+	if (!mps || !mps->text_file_path || !*mps->text_file_path)
+		return;
+
+	const char *str = text ? text : "";
+	if (mps->last_text_written && strcmp(mps->last_text_written, str) == 0)
+		return;
+
+	os_quick_write_utf8_file(mps->text_file_path, str, strlen(str), false);
+
+	bfree(mps->last_text_written);
+	mps->last_text_written = bstrdup(str);
+}
+
 static void update_current_filename_setting(struct media_playlist_source *mps, obs_data_t *data)
 {
 	struct dstr long_desc = {0};
+	struct dstr name_no_ext = {0};
 	if (!mps || !data)
 		return;
 	if (!mps->actual_media) {
 		obs_data_set_string(data, S_CURRENT_FILE_NAME, " ");
+		obs_data_set_string(data, S_CURRENT_FILE_NAME_NO_EXT, " ");
+		write_track_text_file(mps, "");
 		return;
 	} else if (mps->actual_media->parent) {
 		dstr_catf(&long_desc, "%zu-%zu", mps->actual_media->parent->index + 1, mps->actual_media->index + 1);
@@ -175,7 +235,23 @@ static void update_current_filename_setting(struct media_playlist_source *mps, o
 	}
 	dstr_catf(&long_desc, ": %s", mps->actual_media->path);
 	obs_data_set_string(data, S_CURRENT_FILE_NAME, long_desc.array);
+
+	get_filename_no_ext(mps->actual_media->path, &name_no_ext);
+	obs_data_set_string(data, S_CURRENT_FILE_NAME_NO_EXT, name_no_ext.array ? name_no_ext.array : "");
+	write_track_text_file(mps, name_no_ext.array ? name_no_ext.array : "");
+
 	dstr_free(&long_desc);
+	dstr_free(&name_no_ext);
+}
+
+/* Thin wrapper for code paths that don't already have settings open. */
+static void update_current_filename_state(struct media_playlist_source *mps)
+{
+	if (!mps)
+		return;
+	obs_data_t *settings = obs_source_get_settings(mps->source);
+	update_current_filename_setting(mps, settings);
+	obs_data_release(settings);
 }
 
 /* Empties path selected in media source,
@@ -191,6 +267,7 @@ static void clear_media_source(void *data)
 	obs_source_update(mps->current_media_source, settings);
 	obs_data_release(settings);
 	obs_source_media_stop(mps->source);
+	update_current_filename_state(mps);
 }
 
 /* Checks if the media source has to be updated, because updating its
@@ -244,6 +321,7 @@ static void update_media_source(void *data, bool forced)
 	}
 
 	obs_data_release(settings);
+	update_current_filename_state(mps);
 }
 
 static void select_index_proc_(struct media_playlist_source *mps, size_t media_index, size_t folder_item_index)
@@ -747,6 +825,16 @@ static void mps_destroy(void *data)
 	pthread_mutex_destroy(&mps->mutex);
 	pthread_mutex_destroy(&mps->audio_mutex);
 	bfree(mps->current_media_filename);
+
+	if (mps->placeholder_loaded) {
+		obs_enter_graphics();
+		gs_image_file2_free(&mps->placeholder);
+		obs_leave_graphics();
+	}
+	bfree(mps->placeholder_path);
+	bfree(mps->text_file_path);
+	bfree(mps->last_text_written);
+
 	bfree(mps);
 }
 
@@ -810,13 +898,77 @@ error:
 	return NULL;
 }
 
+/* Lazy-loads (or reloads) the placeholder image on the graphics thread. Must
+ * be called with graphics context active.
+ */
+static void ensure_placeholder_loaded(struct media_playlist_source *mps)
+{
+	if (!mps->placeholder_path_changed)
+		return;
+
+	if (mps->placeholder_loaded) {
+		gs_image_file2_free(&mps->placeholder);
+		mps->placeholder_loaded = false;
+	}
+
+	if (mps->placeholder_path && *mps->placeholder_path) {
+		gs_image_file2_init(&mps->placeholder, mps->placeholder_path);
+		gs_image_file2_init_texture(&mps->placeholder);
+		/* image-file's `loaded` field tells us whether the image was
+		 * actually decoded; only then do we treat it as usable. */
+		if (mps->placeholder.image.loaded) {
+			mps->placeholder_loaded = true;
+		} else {
+			gs_image_file2_free(&mps->placeholder);
+		}
+	}
+
+	mps->placeholder_path_changed = false;
+}
+
+static void render_solid_placeholder(uint32_t width, uint32_t height)
+{
+	gs_effect_t *solid = obs_get_base_effect(OBS_EFFECT_SOLID);
+	if (!solid)
+		return;
+	gs_eparam_t *color_param = gs_effect_get_param_by_name(solid, "color");
+	struct vec4 color;
+	/* AABBGGRR — opaque dark grey */
+	vec4_from_rgba(&color, 0xFF1A1A1A);
+	gs_effect_set_vec4(color_param, &color);
+	while (gs_effect_loop(solid, "Solid"))
+		gs_draw_sprite(NULL, 0, width, height);
+}
+
+static void render_image_placeholder(struct media_playlist_source *mps)
+{
+	gs_effect_t *effect = obs_get_base_effect(OBS_EFFECT_DEFAULT);
+	gs_eparam_t *image = gs_effect_get_param_by_name(effect, "image");
+	gs_effect_set_texture(image, mps->placeholder.image.texture);
+	while (gs_effect_loop(effect, "Draw"))
+		gs_draw_sprite(mps->placeholder.image.texture, 0, mps->placeholder.image.cx,
+			       mps->placeholder.image.cy);
+}
+
 static void mps_video_render(void *data, gs_effect_t *effect)
 {
 	struct media_playlist_source *mps = data;
-	if (mps->actual_media) {
-		obs_source_video_render(mps->current_media_source);
-	} else {
+	if (!mps->actual_media) {
 		obs_source_video_render(NULL);
+		UNUSED_PARAMETER(effect);
+		return;
+	}
+
+	ensure_placeholder_loaded(mps);
+
+	uint32_t inner_w = obs_source_get_width(mps->current_media_source);
+	uint32_t inner_h = obs_source_get_height(mps->current_media_source);
+	if (inner_w > 0 && inner_h > 0) {
+		obs_source_video_render(mps->current_media_source);
+	} else if (mps->placeholder_loaded) {
+		render_image_placeholder(mps);
+	} else {
+		render_solid_placeholder(PLACEHOLDER_WIDTH, PLACEHOLDER_HEIGHT);
 	}
 
 	UNUSED_PARAMETER(effect);
@@ -943,13 +1095,23 @@ static void mps_enum_sources(void *data, obs_source_enum_proc_t cb, void *param)
 static uint32_t mps_width(void *data)
 {
 	struct media_playlist_source *mps = data;
-	return obs_source_get_width(mps->current_media_source);
+	uint32_t w = obs_source_get_width(mps->current_media_source);
+	if (w > 0 || !mps->actual_media)
+		return w;
+	if (mps->placeholder_loaded)
+		return mps->placeholder.image.cx;
+	return PLACEHOLDER_WIDTH;
 }
 
 static uint32_t mps_height(void *data)
 {
 	struct media_playlist_source *mps = data;
-	return obs_source_get_height(mps->current_media_source);
+	uint32_t h = obs_source_get_height(mps->current_media_source);
+	if (h > 0 || !mps->actual_media)
+		return h;
+	if (mps->placeholder_loaded)
+		return mps->placeholder.image.cy;
+	return PLACEHOLDER_HEIGHT;
 }
 
 static void mps_defaults(obs_data_t *settings)
@@ -1069,6 +1231,18 @@ static obs_properties_t *mps_properties(void *data)
 	obs_property_set_long_description(p, "Due to OBS limitations, this will only update if any settings"
 					     " are changed, the selected file is played, or the Properties "
 					     "window is reopened. It will not update when the video ends.");
+
+	p = obs_properties_add_text(props, S_CURRENT_FILE_NAME_NO_EXT, T_CURRENT_FILE_NAME_NO_EXT, OBS_TEXT_INFO);
+	obs_property_set_long_description(p, T_TEXT_FILE_PATH_DESC);
+
+	p = obs_properties_add_path(props, S_TEXT_FILE_PATH, T_TEXT_FILE_PATH, OBS_PATH_FILE_SAVE,
+				    "Text Files (*.txt);;All Files (*.*)", NULL);
+	obs_property_set_long_description(p, T_TEXT_FILE_PATH_DESC);
+
+	p = obs_properties_add_path(props, S_PLACEHOLDER_IMAGE, T_PLACEHOLDER_IMAGE, OBS_PATH_FILE,
+				    "Images (*.png *.jpg *.jpeg *.bmp *.gif);;All Files (*.*)", NULL);
+	obs_property_set_long_description(p, T_PLACEHOLDER_IMAGE_DESC);
+
 	obs_properties_add_button(props, S_REFRESH_FILENAME, T_REFRESH_FILENAME, refresh_filename_clicked);
 	//update_current_filename_property(mps, p);
 
@@ -1186,6 +1360,23 @@ static void mps_update(void *data, obs_data_t *settings)
 	mps->visibility_behavior = obs_data_get_int(settings, S_VISIBILITY_BEHAVIOR);
 	if (mps->visibility_behavior != visibility_behavior) {
 		visibility_behavior_changed = true;
+	}
+
+	/* Track-name text file: store path, force a rewrite if it changed. */
+	const char *new_text_path = obs_data_get_string(settings, S_TEXT_FILE_PATH);
+	if (!mps->text_file_path || strcmp(mps->text_file_path, new_text_path) != 0) {
+		bfree(mps->text_file_path);
+		mps->text_file_path = bstrdup(new_text_path);
+		bfree(mps->last_text_written);
+		mps->last_text_written = NULL;
+	}
+
+	/* Placeholder image: mark for (re)load on the graphics thread. */
+	const char *new_placeholder = obs_data_get_string(settings, S_PLACEHOLDER_IMAGE);
+	if (!mps->placeholder_path || strcmp(mps->placeholder_path, new_placeholder) != 0) {
+		bfree(mps->placeholder_path);
+		mps->placeholder_path = bstrdup(new_placeholder);
+		mps->placeholder_path_changed = true;
 	}
 	mps->restart_behavior = obs_data_get_int(settings, S_RESTART_BEHAVIOR);
 	shuffle = obs_data_get_bool(settings, S_SHUFFLE);

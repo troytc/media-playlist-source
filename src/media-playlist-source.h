@@ -24,6 +24,7 @@ with this program. If not, see <https://www.gnu.org/licenses/>
 #include <util/darray.h>
 #include <util/dstr.h>
 #include <util/deque.h>
+#include <graphics/image-file.h>
 #include <plugin-support.h>
 #include "playlist.h"
 #include "shuffler.h"
@@ -81,6 +82,21 @@ struct media_playlist_source {
 	struct deque audio_timestamps;
 	size_t num_channels;
 	pthread_mutex_t audio_mutex;
+
+	/* Placeholder shown when the current file has no embedded album art.
+	 * placeholder_path is the user-configured image path (may be empty).
+	 * placeholder is loaded lazily on the graphics thread when its path changes.
+	 */
+	char *placeholder_path;
+	bool placeholder_path_changed;
+	bool placeholder_loaded;
+	gs_image_file2_t placeholder;
+
+	/* Text file the current track name (without extension) is written to,
+	 * so an OBS Text Source can display it. May be NULL/empty.
+	 */
+	char *text_file_path;
+	char *last_text_written;
 };
 
 static const char *media_filter =
