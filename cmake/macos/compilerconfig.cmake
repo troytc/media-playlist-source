@@ -29,6 +29,10 @@ if(NOT CMAKE_OSX_SYSROOT OR NOT EXISTS "${CMAKE_OSX_SYSROOT}")
     OUTPUT_STRIP_TRAILING_WHITESPACE
   )
 endif()
+# Propagate the sysroot to any sub-cmake invocations (notably the OBS
+# sources sub-build kicked off by buildspec.cmake), which run before they
+# would otherwise auto-detect the SDK.
+set(ENV{SDKROOT} "${CMAKE_OSX_SYSROOT}")
 execute_process(
   COMMAND xcrun --sdk macosx --show-sdk-version
   OUTPUT_VARIABLE _obs_macos_current_sdk
