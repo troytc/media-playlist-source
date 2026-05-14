@@ -17,9 +17,24 @@ add_compile_options("$<$<NOT:$<COMPILE_LANGUAGE:Swift>>:-fopenmp-simd>")
 # Ensure recent enough Xcode and platform SDK
 set(_obs_macos_minimum_sdk 15.0) # Keep in sync with Xcode
 set(_obs_macos_minimum_xcode 16.0) # Keep in sync with SDK
+
+# CMAKE_OSX_SYSROOT may be unset before project() finishes detecting the SDK
+# (notably on Xcode 16+). Fall back to xcrun if so, and use xcrun for the
+# version too — the older regex on the path failed on path layouts like
+# "MacOSX26.sdk" or symlinks lacking a version suffix.
+if(NOT CMAKE_OSX_SYSROOT OR NOT EXISTS "${CMAKE_OSX_SYSROOT}")
+  execute_process(
+    COMMAND xcrun --sdk macosx --show-sdk-path
+    OUTPUT_VARIABLE CMAKE_OSX_SYSROOT
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+  )
+endif()
+execute_process(
+  COMMAND xcrun --sdk macosx --show-sdk-version
+  OUTPUT_VARIABLE _obs_macos_current_sdk
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
 message(DEBUG "macOS SDK Path: ${CMAKE_OSX_SYSROOT}")
-string(REGEX MATCH ".+/MacOSX.platform/Developer/SDKs/MacOSX([0-9]+\\.[0-9])+\\.sdk$" _ ${CMAKE_OSX_SYSROOT})
-set(_obs_macos_current_sdk ${CMAKE_MATCH_1})
 message(DEBUG "macOS SDK version: ${_obs_macos_current_sdk}")
 if(_obs_macos_current_sdk VERSION_LESS _obs_macos_minimum_sdk)
   message(
