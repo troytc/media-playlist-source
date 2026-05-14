@@ -50,7 +50,13 @@ runs:
         if (( ${+RUNNER_DEBUG} )) setopt XTRACE
 
         print ::group::Install gersemi
-        brew install --quiet obsproject/tools/gersemi
+        # Install via pipx instead of obsproject's homebrew tap. The tap
+        # hits an intermittent "undefined method '[]' for nil" Ruby error
+        # inside Homebrew on Linux runners. pipx pulls gersemi straight
+        # from PyPI and is more reliable.
+        python3 -m pip install --user --quiet pipx
+        python3 -m pipx install --quiet gersemi
+        export PATH="${HOME}/.local/bin:${PATH}"
         print ::endgroup::
 
         print ::group::Run gersemi
